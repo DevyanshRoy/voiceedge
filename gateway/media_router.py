@@ -1,3 +1,4 @@
+# gateway/media_router.py
 """
 media_router.py
 VoiceEdge Gateway - Media Router (FR-2)
@@ -61,6 +62,19 @@ class MediaRouter:
 
     def __init__(self):
         self._routes: Dict[str, MediaRoute] = {}
+        self._relay_tracks: Dict[str, object] = {}
+
+    def register_track(self, client_id: str, track: object) -> None:
+        self._relay_tracks[client_id] = track
+
+    def unregister_track(self, client_id: str) -> None:
+        self._relay_tracks.pop(client_id, None)
+
+    def tracks_for(self, room_client_ids: list[str], sender_id: str) -> list[object]:
+        return [
+            track for client_id, track in self._relay_tracks.items()
+            if client_id in room_client_ids and client_id != sender_id
+        ]
 
     def create_route(
         self, session: Session, on_deliver: Callable[[str, bytes], None]

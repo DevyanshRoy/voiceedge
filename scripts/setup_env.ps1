@@ -1,0 +1,5 @@
+# scripts/setup_env.ps1
+$ErrorActionPreference = "Stop"
+python -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install --upgrade pip
+& .\.venv\Scripts\python.exe -m pip install -r requirements.txt

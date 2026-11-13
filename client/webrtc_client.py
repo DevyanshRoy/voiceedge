@@ -1,178 +1,226 @@
-"""
-webrtc_client.py
-VoiceEdge Client - WebRTC Audio Client
-
-Responsibility:
-    - Register with the signaling server
-    - Wait to be matched with a peer
-    - Perform WebRTC offer/answer/ICE exchange (relayed through signaling server)
-    - Capture local microphone audio and send it over the peer connection
-    - Play back audio received from the peer
-
-Usage:
-    python client/webrtc_client.py --client-id laptop_A --signaling ws://<gateway-ip>:8765
-    python client/webrtc_client.py --client-id laptop_B --signaling ws://<gateway-ip>:8765
-"""
+# client/webrtc_client.py
+"""VoiceEdge gateway-relayed WebRTC client, CLI, and small Tk GUI."""
 
 import argparse
 import asyncio
 import json
 import logging
+import os
+from pathlib import Path
+import socket
+import threading
+import tkinter as tk
+from tkinter import ttk
 
-import numpy as np
-import sounddevice as sd
 import websockets
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
-from aiortc.contrib.media import MediaPlayer
-from aiortc.mediastreams import MediaStreamTrack
+from aiortc import RTCPeerConnection, RTCConfiguration, RTCSessionDescription
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("webrtc_client")
+from client.audio_io import MicrophoneAudioTrack, SpeakerOutput
 
-SAMPLE_RATE = 48000
-CHANNELS = 1
-
-
-class SpeakerAudioTrack:
-    """
-    Consumes frames from a remote audio track and plays them through
-    the local speaker using sounddevice, since aiortc has no built-in
-    speaker output.
-    """
-
-    def __init__(self, track: MediaStreamTrack):
-        self.track = track
-        self._stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16"
-        )
-        self._stream.start()
-        self._task = asyncio.ensure_future(self._play())
-
-    async def _play(self):
-        try:
-            while True:
-                frame = await self.track.recv()
-                pcm = frame.to_ndarray()
-                # Ensure correct shape/dtype for playback
-                pcm = pcm.astype(np.int16).reshape(-1, CHANNELS)
-                self._stream.write(pcm)
-        except Exception as e:
-            logger.info(f"Playback stopped: {e}")
-
-    def stop(self):
-        self._task.cancel()
-        self._stream.stop()
-        self._stream.close()
+log = logging.getLogger("voiceedge.client")
+VERSION = "1"
+SETTINGS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "VoiceEdge" / "client.json"
 
 
 class VoiceEdgeClient:
-    def __init__(self, client_id: str, signaling_url: str):
-        self.client_id = client_id
-        self.signaling_url = signaling_url
-        self.pc: RTCPeerConnection = None
+    def __init__(self, server, name, room="lab", mic=None, speaker=None, status=None):
+        self.server = server if server.startswith("ws://") else f"ws://{server}"
+        self.name, self.room = name, room
+        self.mic_device, self.speaker_device = mic, speaker
+        self.on_status = status or (lambda _message: None)
+        self.pc = None
         self.ws = None
-        self.peer_id: str = None
-        self.speaker_track: SpeakerAudioTrack = None
+        self.mic_track = None
+        self.speaker = None
+        self._stop = asyncio.Event()
+        self.muted = False
 
     async def run(self):
-        async with websockets.connect(self.signaling_url) as ws:
-            self.ws = ws
-            await self._send({"type": "register", "client_id": self.client_id})
-            logger.info(f"Registered as {self.client_id}, waiting for peer...")
+        while not self._stop.is_set():
+            try:
+                self.on_status("Connecting")
+                async with websockets.connect(self.server) as websocket:
+                    self.ws = websocket
+                    await self._send({
+                        "type": "hello", "version": VERSION,
+                        "client_id": self.name, "name": self.name, "room": self.room,
+                    })
+                    async for raw in websocket:
+                        await self._handle(json.loads(raw))
+            except (OSError, websockets.exceptions.WebSocketException) as exc:
+                self.on_status(f"Error: {exc}")
+                if self._stop.is_set():
+                    break
+                await asyncio.sleep(2)
+            finally:
+                await self._close_pc()
 
-            async for raw_message in ws:
-                message = json.loads(raw_message)
-                await self._handle_message(message)
-
-    async def _handle_message(self, message: dict):
-        msg_type = message.get("type")
-
-        if msg_type == "waiting":
-            logger.info("Waiting for a peer to join...")
-
-        elif msg_type == "matched":
-            self.peer_id = message["peer_id"]
-            logger.info(f"Matched with peer: {self.peer_id}")
-            await self._setup_peer_connection()
-            if message["initiator"]:
-                await self._create_offer()
-
-        elif msg_type == "offer":
-            await self._setup_peer_connection()
-            await self.pc.setRemoteDescription(
-                RTCSessionDescription(sdp=message["sdp"], type="offer")
-            )
-            answer = await self.pc.createAnswer()
-            await self.pc.setLocalDescription(answer)
-            await self._send({
-                "type": "answer",
-                "target_id": self.peer_id,
-                "sdp": self.pc.localDescription.sdp,
-            })
-
-        elif msg_type == "answer":
+    async def _handle(self, message):
+        kind = message.get("type")
+        if kind == "ready":
+            await self._make_offer()
+        elif kind == "answer":
             await self.pc.setRemoteDescription(
                 RTCSessionDescription(sdp=message["sdp"], type="answer")
             )
+            names = message.get("session", {}).get("clients", [])
+            peer = next((name for name in names if name != self.name), "room")
+            self.on_status(f"In call with {peer}" if len(names) > 1 else "Waiting for another client")
+        elif kind == "error":
+            self.on_status(message.get("message", "Gateway error"))
 
-        elif msg_type == "ice_candidate":
-            candidate = message.get("candidate")
-            if candidate:
-                await self.pc.addIceCandidate(candidate)
-
-    async def _setup_peer_connection(self):
-        if self.pc is not None:
-            return
-
-        self.pc = RTCPeerConnection()
-
-        # Capture microphone audio.
-        # NOTE: device format is platform-specific.
-        #   Windows: MediaPlayer("audio=<device name>", format="dshow")
-        #   Linux:   MediaPlayer("default", format="pulse")
-        #   macOS:   MediaPlayer(":0", format="avfoundation")
-        player = MediaPlayer("audio=Microphone Array (AMD Audio Device)", format="dshow")
-        if player.audio:
-            self.pc.addTrack(player.audio)
+    async def _make_offer(self):
+        self.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        self.mic_track = MicrophoneAudioTrack(self.mic_device)
+        transceiver = self.pc.addTransceiver("audio", direction="sendrecv")
+        transceiver.sender.replaceTrack(self.mic_track)
+        self.mic_track.muted = self.muted
 
         @self.pc.on("track")
         def on_track(track):
-            logger.info(f"Receiving remote track: {track.kind}")
             if track.kind == "audio":
-                self.speaker_track = SpeakerAudioTrack(track)
+                self.speaker = SpeakerOutput(self.speaker_device)
+                self.speaker.start(track)
 
-        @self.pc.on("icecandidate")
-        async def on_icecandidate(candidate):
-            if candidate:
-                await self._send({
-                    "type": "ice_candidate",
-                    "target_id": self.peer_id,
-                    "candidate": candidate.to_sdp(),
-                })
-
-    async def _create_offer(self):
         offer = await self.pc.createOffer()
         await self.pc.setLocalDescription(offer)
         await self._send({
             "type": "offer",
-            "target_id": self.peer_id,
             "sdp": self.pc.localDescription.sdp,
         })
 
-    async def _send(self, message: dict):
+    async def _send(self, message):
         await self.ws.send(json.dumps(message))
+
+    async def _close_pc(self):
+        if self.mic_track:
+            self.mic_track.stop()
+            self.mic_track = None
+        if self.speaker:
+            self.speaker.stop()
+            self.speaker = None
+        if self.pc:
+            await self.pc.close()
+            self.pc = None
+
+    async def stop(self):
+        self._stop.set()
+        if self.ws:
+            await self._send({"type": "bye"})
+            await self.ws.close()
+
+    def set_muted(self, muted):
+        self.muted = muted
+        if self.mic_track:
+            self.mic_track.muted = muted
+
+
+def list_devices():
+    import sounddevice as sd
+    for index, device in enumerate(sd.query_devices()):
+        print(f"{index}: {device['name']} (in={device['max_input_channels']}, out={device['max_output_channels']})")
+
+
+def cli_main(args):
+    if args.list_devices:
+        list_devices()
+        return
+    client = VoiceEdgeClient(args.server, args.name, args.room, args.mic, args.speaker)
+    try:
+        asyncio.run(client.run())
+    except KeyboardInterrupt:
+        pass
+
+
+def gui_main():
+    root = tk.Tk()
+    root.title("VoiceEdge Client")
+    frame = ttk.Frame(root, padding=12)
+    frame.grid()
+    fields = {}
+    saved = {}
+    if SETTINGS_PATH.exists():
+        try:
+            saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+    for row, (label, default) in enumerate((("Gateway", saved.get("server", "127.0.0.1:8765")),
+                                             ("Your name", saved.get("name", socket.gethostname())),
+                                             ("Room", saved.get("room", "lab")))):
+        ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
+        value = tk.StringVar(value=default)
+        ttk.Entry(frame, textvariable=value, width=30).grid(row=row, column=1)
+        fields[label] = value
+    status = tk.StringVar(value="Disconnected")
+    ttk.Label(frame, textvariable=status).grid(row=4, column=0, columnspan=2)
+    devices = ["Default"]
+    try:
+        import sounddevice as sd
+        devices = ["Default"] + [d["name"] for d in sd.query_devices()]
+    except (OSError, ImportError):
+        pass
+    ttk.Label(frame, text="Mic").grid(row=6, column=0, sticky="w")
+    mic = tk.StringVar(value=saved.get("mic", "Default"))
+    ttk.Combobox(frame, textvariable=mic, values=devices, width=28).grid(row=6, column=1)
+    ttk.Label(frame, text="Speaker").grid(row=7, column=0, sticky="w")
+    speaker = tk.StringVar(value=saved.get("speaker", "Default"))
+    ttk.Combobox(frame, textvariable=speaker, values=devices, width=28).grid(row=7, column=1)
+    loop = asyncio.new_event_loop()
+    client = None
+
+    def connect():
+        nonlocal client
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps({
+            "server": fields["Gateway"].get(), "name": fields["Your name"].get(),
+            "room": fields["Room"].get(), "mic": mic.get(), "speaker": speaker.get(),
+        }), encoding="utf-8")
+        client = VoiceEdgeClient(fields["Gateway"].get(), fields["Your name"].get(),
+                                 fields["Room"].get(), None if mic.get() == "Default" else mic.get(),
+                                 None if speaker.get() == "Default" else speaker.get(), status=status.set)
+        threading.Thread(target=lambda: loop.run_until_complete(client.run()), daemon=True).start()
+
+    def disconnect():
+        if client:
+            asyncio.run_coroutine_threadsafe(client.stop(), loop)
+    ttk.Button(frame, text="Connect", command=connect).grid(row=3, column=0)
+    ttk.Button(frame, text="Disconnect", command=disconnect).grid(row=3, column=1)
+    muted = tk.BooleanVar()
+    ttk.Checkbutton(frame, text="Mute", variable=muted,
+                    command=lambda: client and client.set_muted(muted.get())).grid(row=8, column=0)
+    def find_gateway():
+        def listen():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(1.5)
+            try:
+                sock.bind(("", 8766))
+                data, address = sock.recvfrom(1024)
+                beacon = json.loads(data.decode())
+                root.after(0, lambda: fields["Gateway"].set(f"{address[0]}:{beacon['ws_port']}"))
+            except (OSError, ValueError, KeyError):
+                root.after(0, lambda: status.set("Gateway not found"))
+            finally:
+                sock.close()
+        threading.Thread(target=listen, daemon=True).start()
+    ttk.Button(frame, text="Find gateway", command=find_gateway).grid(row=8, column=1)
+    ttk.Label(frame, text="Headphones recommended").grid(row=5, column=0, columnspan=2)
+    root.mainloop()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VoiceEdge WebRTC Client")
-    parser.add_argument("--client-id", required=True, help="Unique client identifier")
-    parser.add_argument(
-        "--signaling", default="ws://localhost:8765", help="Signaling server URL"
-    )
+    parser = argparse.ArgumentParser(description="VoiceEdge client")
+    parser.add_argument("--server", default="127.0.0.1:8765")
+    parser.add_argument("--name", default=socket.gethostname())
+    parser.add_argument("--room", default="lab")
+    parser.add_argument("--mic")
+    parser.add_argument("--speaker")
+    parser.add_argument("--list-devices", action="store_true")
+    parser.add_argument("--cli", action="store_true")
     args = parser.parse_args()
-
-    client = VoiceEdgeClient(args.client_id, args.signaling)
-    asyncio.run(client.run())
+    if args.cli or args.list_devices:
+        cli_main(args)
+    else:
+        gui_main()
 
 
 if __name__ == "__main__":

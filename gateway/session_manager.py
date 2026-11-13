@@ -1,3 +1,4 @@
+# gateway/session_manager.py
 """
 session_manager.py
 VoiceEdge Gateway - Session Manager (FR-3)
@@ -20,6 +21,7 @@ class Session:
     client_b_id: str
     start_time: float = field(default_factory=time.time)
     status: str = "active"  # active | ended | on_hold
+    room: str = "lab"
 
     def duration(self) -> float:
         return time.time() - self.start_time
@@ -33,12 +35,13 @@ class SessionManager:
     def __init__(self):
         self._sessions: Dict[str, Session] = {}
 
-    def create_session(self, client_a_id: str, client_b_id: str) -> Session:
+    def create_session(self, client_a_id: str, client_b_id: str, room: str = "lab") -> Session:
         session_id = str(uuid.uuid4())
         session = Session(
             session_id=session_id,
             client_a_id=client_a_id,
             client_b_id=client_b_id,
+            room=room,
         )
         self._sessions[session_id] = session
         return session
@@ -65,6 +68,15 @@ class SessionManager:
             if client_id in (session.client_a_id, session.client_b_id):
                 return session
         return None
+
+    def end_sessions_for_client(self, client_id: str) -> list[Session]:
+        ended = [
+            session for session in self._sessions.values()
+            if client_id in (session.client_a_id, session.client_b_id)
+        ]
+        for session in ended:
+            self.end_session(session.session_id)
+        return ended
 
 
 # Quick manual test when run directly

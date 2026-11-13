@@ -1,3 +1,4 @@
+# gateway/metrics_engine.py
 """
 metrics_engine.py
 VoiceEdge Gateway - Metrics Engine (FR-5)
@@ -44,7 +45,12 @@ class MetricsEngine:
 
     def record_frame_latency(self, latency_ms: float) -> None:
         """Call this whenever a frame's send->receive latency is measured."""
-        self.metrics.last_latency_ms = latency_ms
+        self.metrics.last_latency_ms = max(0.0, latency_ms)
+
+    def record_routed_frame(self, size_bytes: int, latency_ms: float = 0.0) -> None:
+        self.record_packet(size_bytes)
+        if latency_ms:
+            self.record_frame_latency(latency_ms)
 
     def record_packet(self, size_bytes: int) -> None:
         self.metrics.total_packets_routed += 1
@@ -74,9 +80,9 @@ class MetricsEngine:
         if snap["cpu_percent"] > 90 or snap["memory_percent"] > 90:
             return "FAULT"
         if snap["latency_ms"] > 150:
-            return "HIGH_LATENCY"
+            return "HIGHLAT"
         if snap["active_calls"] > 0:
-            return "ACTIVE_CALL"
+            return "OK"
         return "HEALTHY"
 
 

@@ -1,120 +1,188 @@
-"""
-signaling_server.py
-VoiceEdge Gateway - Signaling Server
-
-Responsibility:
-    Handle the WebRTC signaling handshake between two clients:
-        - Exchange SDP offers/answers
-        - Exchange ICE candidates
-        - Notify gateway to create a Session once both clients are matched
-
-    This uses websockets as a simple signaling transport. The actual
-    audio media itself does NOT flow through this server - only the
-    connection setup metadata does. Once WebRTC connects, audio flows
-    through the gateway's MediaRouter (media_router.py).
-"""
+# gateway/signaling_server.py
+"""Gateway-terminated WebRTC signaling and media relay."""
 
 import asyncio
 import json
 import logging
-from typing import Dict
+from dataclasses import dataclass, field
+from typing import Any
 
+from aiortc import RTCPeerConnection, RTCConfiguration, RTCSessionDescription
+from aiortc.contrib.media import MediaRelay
+from aiortc.mediastreams import AudioStreamTrack
 import websockets
 
+from gateway.media_router import MediaRouter
 from gateway.session_manager import SessionManager
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("signaling_server")
+log = logging.getLogger("voiceedge.signaling")
+PROTOCOL_VERSION = "1"
+
+
+@dataclass
+class ClientConnection:
+    client_id: str
+    name: str
+    room: str
+    websocket: Any
+    pc: RTCPeerConnection | None = None
+    tracks: list[Any] = field(default_factory=list)
+
+
+class MeteredTrack(AudioStreamTrack):
+    def __init__(self, source, metrics):
+        super().__init__()
+        self.source = source
+        self.metrics = metrics
+
+    async def recv(self):
+        frame = await self.source.recv()
+        self.metrics.record_routed_frame(frame.samples * 2)
+        return frame
 
 
 class SignalingServer:
-    def __init__(self, session_manager: SessionManager, host: str = "0.0.0.0", port: int = 8765):
+    def __init__(
+        self,
+        session_manager: SessionManager,
+        media_router: MediaRouter | None = None,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+        version: str = PROTOCOL_VERSION,
+        gateway_enabled=None,
+        metrics_engine=None,
+    ):
         self.session_manager = session_manager
-        self.host = host
-        self.port = port
-        # client_id -> websocket connection
-        self.clients: Dict[str, object] = {}
-        # simple waiting-room: first client waits here until a second joins
-        self.waiting_client_id: str = None
+        self.media_router = media_router or MediaRouter()
+        self.host, self.port, self.version = host, port, version
+        self.gateway_enabled = gateway_enabled or (lambda: True)
+        self.metrics_engine = metrics_engine
+        self.clients: dict[str, ClientConnection] = {}
+        self._server = None
+        self._relay = MediaRelay()
 
     async def handler(self, websocket):
-        client_id = None
+        connection: ClientConnection | None = None
         try:
-            async for raw_message in websocket:
-                message = json.loads(raw_message)
-                msg_type = message.get("type")
-
-                if msg_type == "register":
-                    client_id = message["client_id"]
-                    self.clients[client_id] = websocket
-                    logger.info(f"Client registered: {client_id}")
-                    await self._try_match(client_id)
-
-                elif msg_type in ("offer", "answer", "ice_candidate"):
-                    await self._relay(message)
-
+            async for raw in websocket:
+                message = json.loads(raw)
+                kind = message.get("type")
+                if kind == "hello":
+                    connection = await self._hello(websocket, message)
+                elif connection and kind == "offer":
+                    await self._offer(connection, message)
+                elif connection and kind == "bye":
+                    break
                 else:
-                    logger.warning(f"Unknown message type: {msg_type}")
-
-        except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Client disconnected: {client_id}")
+                    await self._send(websocket, {"type": "error", "message": "Send hello first."})
+        except (json.JSONDecodeError, websockets.exceptions.ConnectionClosed):
+            pass
+        except Exception:
+            log.exception("Unhandled signaling error")
+            if connection:
+                await self._send(connection.websocket, {"type": "error", "message": "Gateway error."})
         finally:
-            if client_id and client_id in self.clients:
-                del self.clients[client_id]
-            if self.waiting_client_id == client_id:
-                self.waiting_client_id = None
+            if connection:
+                await self._disconnect(connection)
 
-    async def _try_match(self, client_id: str) -> None:
-        """
-        Simple pairing logic: first client waits, second client
-        triggers session creation and both are notified.
-        """
-        if self.waiting_client_id is None:
-            self.waiting_client_id = client_id
-            await self._send(client_id, {"type": "waiting"})
+    async def _hello(self, websocket, message: dict) -> ClientConnection | None:
+        if message.get("version") != self.version:
+            await self._send(websocket, {
+                "type": "error",
+                "code": "INCOMPATIBLE_VERSION",
+                "message": f"Incompatible client version; gateway requires {self.version}.",
+            })
+            return None
+        if not self.gateway_enabled():
+            await self._send(websocket, {"type": "error", "code": "GATEWAY_STOPPED", "message": "Gateway is stopped."})
+            return None
+        client_id = str(message.get("client_id", "")).strip()
+        if not client_id or client_id in self.clients:
+            await self._send(websocket, {"type": "error", "message": "Client name is missing or already in use."})
+            return None
+        connection = ClientConnection(
+            client_id=client_id,
+            name=str(message.get("name") or client_id),
+            room=str(message.get("room") or "lab"),
+            websocket=websocket,
+        )
+        self.clients[client_id] = connection
+        room_clients = self._room_clients(connection.room)
+        if len(room_clients) >= 2:
+            self.session_manager.create_session(
+                room_clients[-2].client_id, room_clients[-1].client_id, connection.room
+            )
+        await self._send(websocket, {"type": "ready", "room": connection.room})
+        return connection
+
+    async def _offer(self, connection: ClientConnection, message: dict) -> None:
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        connection.pc = pc
+        pc.addTransceiver("audio", direction="sendrecv")
+        for other in self._room_clients(connection.room):
+            if other.client_id != connection.client_id:
+                for track in self.media_router.tracks_for(
+                    [other.client_id], ""
+                ):
+                    pc.addTrack(MeteredTrack(track, self.metrics_engine) if self.metrics_engine else track)
+
+        @pc.on("track")
+        def on_track(track):
+            if track.kind != "audio":
+                return
+            relay_track = self._relay.subscribe(track)
+            connection.tracks.append(relay_track)
+            self.media_router.register_track(connection.client_id, relay_track)
+            for other in self._room_clients(connection.room):
+                if other.client_id != connection.client_id and other.pc:
+                    other.pc.addTrack(
+                        MeteredTrack(relay_track, self.metrics_engine)
+                        if self.metrics_engine else relay_track
+                    )
+
+        @pc.on("connectionstatechange")
+        async def on_state_change():
+            if pc.connectionState in {"failed", "closed", "disconnected"}:
+                await self._disconnect(connection)
+
+        await pc.setRemoteDescription(RTCSessionDescription(
+            sdp=message["sdp"], type="offer"
+        ))
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        await self._send(connection.websocket, {
+            "type": "answer",
+            "sdp": pc.localDescription.sdp,
+            "session": self._room_status(connection.room),
+        })
+
+    def _room_clients(self, room: str) -> list[ClientConnection]:
+        return [client for client in self.clients.values() if client.room == room]
+
+    def _room_status(self, room: str) -> dict:
+        clients = self._room_clients(room)
+        return {"clients": [client.name for client in clients]}
+
+    async def _disconnect(self, connection: ClientConnection) -> None:
+        if self.clients.get(connection.client_id) is not connection:
             return
+        self.clients.pop(connection.client_id, None)
+        self.media_router.unregister_track(connection.client_id)
+        self.session_manager.end_sessions_for_client(connection.client_id)
+        if connection.pc and connection.pc.connectionState != "closed":
+            await connection.pc.close()
 
-        peer_id = self.waiting_client_id
-        self.waiting_client_id = None
+    async def _send(self, websocket, message: dict) -> None:
+        await websocket.send(json.dumps(message))
 
-        session = self.session_manager.create_session(peer_id, client_id)
-        logger.info(f"Session created: {session.session_id} ({peer_id} <-> {client_id})")
+    async def start(self):
+        self._server = await websockets.serve(self.handler, self.host, self.port)
+        log.info("Signaling server listening on ws://%s:%s", self.host, self.port)
+        await asyncio.Future()
 
-        # Tell the first (waiting) client to initiate the offer
-        await self._send(peer_id, {
-            "type": "matched",
-            "session_id": session.session_id,
-            "peer_id": client_id,
-            "initiator": True,
-        })
-        # Tell the second client to expect an offer
-        await self._send(client_id, {
-            "type": "matched",
-            "session_id": session.session_id,
-            "peer_id": peer_id,
-            "initiator": False,
-        })
-
-    async def _relay(self, message: dict) -> None:
-        """Forward offer/answer/ICE candidates to the intended peer."""
-        target_id = message.get("target_id")
-        if target_id and target_id in self.clients:
-            await self._send(target_id, message)
-        else:
-            logger.warning(f"Relay failed - unknown target: {target_id}")
-
-    async def _send(self, client_id: str, message: dict) -> None:
-        websocket = self.clients.get(client_id)
-        if websocket:
-            await websocket.send(json.dumps(message))
-
-    async def start(self) -> None:
-        logger.info(f"Signaling server starting on ws://{self.host}:{self.port}")
-        async with websockets.serve(self.handler, self.host, self.port):
-            await asyncio.Future()  # run forever
-
-
-if __name__ == "__main__":
-    session_manager = SessionManager()
-    server = SignalingServer(session_manager)
-    asyncio.run(server.start())
+    async def stop(self):
+        for client in list(self.clients.values()):
+            await self._disconnect(client)
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
