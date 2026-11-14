@@ -5,6 +5,6 @@ param(
     [string]$Serial = "off",
     [switch]$NoMonitor
 )
-$argsList = @("gateway\main.py", "--host", $Host, "--port", $Port, "--serial", $Serial)
+$argsList = @("-m", "gateway.main", "--host", $Host, "--port", $Port, "--serial", $Serial)
 if ($NoMonitor) { $argsList += "--no-monitor" }
 python @argsList

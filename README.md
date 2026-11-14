@@ -83,11 +83,26 @@ For development, run the Python programs instead of the executables:
 .\scripts\run_client.ps1 -Server 127.0.0.1:8765 -Name LaptopA
 ```
 
+On macOS or Linux, use the shell scripts from the repository root:
+
+```bash
+bash scripts/setup_env.sh
+bash scripts/run_gateway.sh --host 0.0.0.0 --port 8765 --serial off
+bash scripts/run_client.sh --server 127.0.0.1:8765 --name LaptopA
+```
+
+Packaged executables are operating-system-specific; build them on the same
+operating system where they will run.
+
 The CLI client can list audio devices:
 
 ```powershell
 python -m client.webrtc_client --list-devices
 ```
+
+On macOS or Linux, use `.venv/bin/python -m client.webrtc_client --list-devices`.
+Linux may require the system PortAudio library (for example,
+`libportaudio2`) for audio device access.
 
 Use `--cli` for a second local client. Two local clients may compete for one
 microphone, so separate microphones or a second laptop is more reliable.
