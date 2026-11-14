@@ -36,7 +36,7 @@ except Exception:
 
 
 class VoiceEdgeClient:
-    def __init__(self, server, name, room="lab", mic=None, speaker=None, status=None):
+    def __init__(self, server, name, room="lab", mic=None, speaker=None, status=None, muted=False):
         self.server = server if server.startswith("ws://") else f"ws://{server}"
         self.name, self.room = name, room
         self.mic_device, self.speaker_device = mic, speaker
@@ -46,7 +46,7 @@ class VoiceEdgeClient:
         self.mic_track = None
         self.speaker = None
         self._stop = asyncio.Event()
-        self.muted = False
+        self.muted = muted
 
     async def run(self):
         connected = False
@@ -94,6 +94,11 @@ class VoiceEdgeClient:
                 peer = next((name for name in names if name != self.name), "room")
                 log.info("Active participants in room '%s': %s", self.room, names)
                 self.on_status(f"Connected: In call with {peer}" if len(names) > 1 else "Connected: Waiting for another client")
+            elif kind == "session_update":
+                names = message.get("session", {}).get("clients", [])
+                peer = next((name for name in names if name != self.name), "room")
+                log.info("Session update in room '%s': %s", self.room, names)
+                self.on_status(f"Connected: In call with {peer}" if len(names) > 1 else "Connected: Waiting for another client")
             elif kind == "error":
                 log.error("Gateway error: %s", message.get("message"))
                 self.on_status(message.get("message", "Gateway error"))
@@ -104,8 +109,7 @@ class VoiceEdgeClient:
         try:
             self.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
             self.mic_track = MicrophoneAudioTrack(self.mic_device)
-            transceiver = self.pc.addTransceiver("audio", direction="sendrecv")
-            transceiver.sender.replaceTrack(self.mic_track)
+            self.pc.addTrack(self.mic_track)
             self.mic_track.muted = self.muted
 
             @self.pc.on("track")
@@ -242,7 +246,8 @@ def gui_main():
         }), encoding="utf-8")
         client = VoiceEdgeClient(fields["Gateway"].get(), fields["Your name"].get(),
                                  fields["Room"].get(), None if mic.get() == "Default" else mic.get(),
-                                 None if speaker.get() == "Default" else speaker.get(), status=status.set)
+                                 None if speaker.get() == "Default" else speaker.get(), status=status.set,
+                                 muted=muted.get())
         def run_thread():
             nonlocal client_loop
             client_loop = asyncio.new_event_loop()

@@ -5,11 +5,13 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Any
 
+import av
+import numpy as np
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCSessionDescription
-from aiortc.contrib.media import MediaRelay
-from aiortc.mediastreams import AudioStreamTrack
+from aiortc.mediastreams import AudioStreamTrack, MediaStreamError
 import websockets
 
 from gateway.media_router import MediaRouter
@@ -19,6 +21,44 @@ log = logging.getLogger("voiceedge.signaling")
 PROTOCOL_VERSION = "1"
 
 
+# gateway/signaling_server.py  (replace GatewayRelayTrack)
+class GatewayRelayTrack(AudioStreamTrack):
+    kind = "audio"
+
+    def __init__(self):
+        super().__init__()
+        self._queue = asyncio.Queue(maxsize=50)
+        self._pts = 0
+        self._resampler = av.AudioResampler(format="s16", layout="mono", rate=48000)
+
+    def put_frame(self, frame):
+        try:
+            frames = self._resampler.resample(frame)
+        except Exception:
+            return
+        for f in frames:
+            try:
+                self._queue.put_nowait(f)
+            except asyncio.QueueFull:
+                try:
+                    self._queue.get_nowait()
+                    self._queue.put_nowait(f)
+                except Exception:
+                    pass
+
+    async def recv(self):
+        try:
+            frame = await asyncio.wait_for(self._queue.get(), timeout=0.04)
+        except asyncio.TimeoutError:
+            frame = av.AudioFrame.from_ndarray(
+                np.zeros((1, 960), dtype=np.int16), format="s16", layout="mono"
+            )
+            frame.sample_rate = 48000
+        frame.pts = self._pts
+        frame.time_base = Fraction(1, 48000)
+        self._pts += frame.samples
+        return frame
+        
 @dataclass
 class ClientConnection:
     client_id: str
@@ -26,7 +66,8 @@ class ClientConnection:
     room: str
     websocket: Any
     pc: RTCPeerConnection | None = None
-    tracks: list[Any] = field(default_factory=list)
+    relay_track: GatewayRelayTrack | None = None
+    forward_task: asyncio.Task | None = None
 
 
 class MeteredTrack(AudioStreamTrack):
@@ -59,7 +100,6 @@ class SignalingServer:
         self.metrics_engine = metrics_engine
         self.clients: dict[str, ClientConnection] = {}
         self._server = None
-        self._relay = MediaRelay()
 
     async def handler(self, websocket):
         connection: ClientConnection | None = None
@@ -118,27 +158,22 @@ class SignalingServer:
     async def _offer(self, connection: ClientConnection, message: dict) -> None:
         pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         connection.pc = pc
-        pc.addTransceiver("audio", direction="sendrecv")
-        for other in self._room_clients(connection.room):
-            if other.client_id != connection.client_id:
-                for track in self.media_router.tracks_for(
-                    [other.client_id], ""
-                ):
-                    pc.addTrack(MeteredTrack(track, self.metrics_engine) if self.metrics_engine else track)
+        connection.relay_track = GatewayRelayTrack()
+        track_to_send = (
+            MeteredTrack(connection.relay_track, self.metrics_engine)
+            if self.metrics_engine
+            else connection.relay_track
+        )
+        pc.addTrack(track_to_send)
 
         @pc.on("track")
         def on_track(track):
             if track.kind != "audio":
                 return
-            relay_track = self._relay.subscribe(track)
-            connection.tracks.append(relay_track)
-            self.media_router.register_track(connection.client_id, relay_track)
-            for other in self._room_clients(connection.room):
-                if other.client_id != connection.client_id and other.pc:
-                    other.pc.addTrack(
-                        MeteredTrack(relay_track, self.metrics_engine)
-                        if self.metrics_engine else relay_track
-                    )
+            log.info("Gateway received audio track from %s", connection.client_id)
+            connection.forward_task = asyncio.create_task(
+                self._forward_audio(connection, track)
+            )
 
         @pc.on("connectionstatechange")
         async def on_state_change():
@@ -155,6 +190,27 @@ class SignalingServer:
             "sdp": pc.localDescription.sdp,
             "session": self._room_status(connection.room),
         })
+        for other in self._room_clients(connection.room):
+            if other.client_id != connection.client_id:
+                try:
+                    await self._send(other.websocket, {
+                        "type": "session_update",
+                        "session": self._room_status(connection.room),
+                    })
+                except Exception:
+                    pass
+
+    async def _forward_audio(self, sender: ClientConnection, track: AudioStreamTrack):
+        try:
+            while True:
+                frame = await track.recv()
+                for other in self._room_clients(sender.room):
+                    if other.client_id != sender.client_id and other.relay_track:
+                        other.relay_track.put_frame(frame)
+        except (MediaStreamError, asyncio.CancelledError):
+            pass
+        except Exception:
+            log.exception("Error in gateway audio forwarder for %s", sender.client_id)
 
     def _room_clients(self, room: str) -> list[ClientConnection]:
         return [client for client in self.clients.values() if client.room == room]
@@ -167,10 +223,30 @@ class SignalingServer:
         if self.clients.get(connection.client_id) is not connection:
             return
         self.clients.pop(connection.client_id, None)
-        self.media_router.unregister_track(connection.client_id)
+        if connection.forward_task:
+            connection.forward_task.cancel()
+            connection.forward_task = None
         self.session_manager.end_sessions_for_client(connection.client_id)
         if connection.pc and connection.pc.connectionState != "closed":
             await connection.pc.close()
+        for other in self._room_clients(connection.room):
+            try:
+                await self._send(other.websocket, {
+                    "type": "session_update",
+                    "session": self._room_status(connection.room),
+                })
+            except Exception:
+                pass
+        if connection.pc and connection.pc.connectionState != "closed":
+            await connection.pc.close()
+        for other in self._room_clients(connection.room):
+            try:
+                await self._send(other.websocket, {
+                    "type": "session_update",
+                    "session": self._room_status(connection.room),
+                })
+            except Exception:
+                pass
 
     async def _send(self, websocket, message: dict) -> None:
         await websocket.send(json.dumps(message))
