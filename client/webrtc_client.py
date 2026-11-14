@@ -19,7 +19,20 @@ from client.audio_io import MicrophoneAudioTrack, SpeakerOutput
 
 log = logging.getLogger("voiceedge.client")
 VERSION = "1"
-SETTINGS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "VoiceEdge" / "client.json"
+APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "VoiceEdge"
+APP_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_PATH = APP_DIR / "client.json"
+CLIENT_LOG_PATH = APP_DIR / "client.log"
+
+try:
+    logging.basicConfig(
+        filename=str(CLIENT_LOG_PATH),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s]: %(message)s",
+        encoding="utf-8",
+    )
+except Exception:
+    pass
 
 
 class VoiceEdgeClient:
@@ -36,58 +49,81 @@ class VoiceEdgeClient:
         self.muted = False
 
     async def run(self):
-        while not self._stop.is_set():
-            try:
-                self.on_status("Connecting")
-                async with websockets.connect(self.server) as websocket:
-                    self.ws = websocket
-                    await self._send({
-                        "type": "hello", "version": VERSION,
-                        "client_id": self.name, "name": self.name, "room": self.room,
-                    })
-                    async for raw in websocket:
-                        await self._handle(json.loads(raw))
-            except (OSError, websockets.exceptions.WebSocketException) as exc:
-                self.on_status(f"Error: {exc}")
-                if self._stop.is_set():
-                    break
-                await asyncio.sleep(2)
-            finally:
-                await self._close_pc()
+        connected = False
+        log.info("Starting connection to server=%s client_id=%s room=%s", self.server, self.name, self.room)
+        try:
+            self.on_status("Connecting...")
+            async with websockets.connect(self.server, open_timeout=4) as websocket:
+                self.ws = websocket
+                connected = True
+                log.info("WebSocket connected to %s", self.server)
+                self.on_status("Connected")
+                await self._send({
+                    "type": "hello", "version": VERSION,
+                    "client_id": self.name, "name": self.name, "room": self.room,
+                })
+                async for raw in websocket:
+                    if self._stop.is_set():
+                        break
+                    await self._handle(json.loads(raw))
+        except asyncio.CancelledError:
+            log.info("Connection task cancelled")
+        except (OSError, websockets.exceptions.WebSocketException, TimeoutError) as exc:
+            log.warning("Connection failed to %s: %s", self.server, exc)
+            if not self._stop.is_set():
+                if not connected:
+                    self.on_status(f"Not able to connect ({type(exc).__name__})")
+                else:
+                    self.on_status("Disconnected")
+        finally:
+            await self._close_pc()
+            if self._stop.is_set():
+                self.on_status("Disconnected")
 
     async def _handle(self, message):
-        kind = message.get("type")
-        if kind == "ready":
-            await self._make_offer()
-        elif kind == "answer":
-            await self.pc.setRemoteDescription(
-                RTCSessionDescription(sdp=message["sdp"], type="answer")
-            )
-            names = message.get("session", {}).get("clients", [])
-            peer = next((name for name in names if name != self.name), "room")
-            self.on_status(f"In call with {peer}" if len(names) > 1 else "Waiting for another client")
-        elif kind == "error":
-            self.on_status(message.get("message", "Gateway error"))
+        try:
+            kind = message.get("type")
+            log.info("Received signaling message: %s", kind)
+            if kind == "ready":
+                await self._make_offer()
+            elif kind == "answer":
+                await self.pc.setRemoteDescription(
+                    RTCSessionDescription(sdp=message["sdp"], type="answer")
+                )
+                names = message.get("session", {}).get("clients", [])
+                peer = next((name for name in names if name != self.name), "room")
+                log.info("Active participants in room '%s': %s", self.room, names)
+                self.on_status(f"Connected: In call with {peer}" if len(names) > 1 else "Connected: Waiting for another client")
+            elif kind == "error":
+                log.error("Gateway error: %s", message.get("message"))
+                self.on_status(message.get("message", "Gateway error"))
+        except Exception as exc:
+            log.exception("Error handling signaling message: %s", exc)
 
     async def _make_offer(self):
-        self.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-        self.mic_track = MicrophoneAudioTrack(self.mic_device)
-        transceiver = self.pc.addTransceiver("audio", direction="sendrecv")
-        transceiver.sender.replaceTrack(self.mic_track)
-        self.mic_track.muted = self.muted
+        try:
+            self.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+            self.mic_track = MicrophoneAudioTrack(self.mic_device)
+            transceiver = self.pc.addTransceiver("audio", direction="sendrecv")
+            transceiver.sender.replaceTrack(self.mic_track)
+            self.mic_track.muted = self.muted
 
-        @self.pc.on("track")
-        def on_track(track):
-            if track.kind == "audio":
-                self.speaker = SpeakerOutput(self.speaker_device)
-                self.speaker.start(track)
+            @self.pc.on("track")
+            def on_track(track):
+                if track.kind == "audio":
+                    log.info("Received incoming audio track from peer")
+                    self.speaker = SpeakerOutput(self.speaker_device)
+                    self.speaker.start(track)
 
-        offer = await self.pc.createOffer()
-        await self.pc.setLocalDescription(offer)
-        await self._send({
-            "type": "offer",
-            "sdp": self.pc.localDescription.sdp,
-        })
+            offer = await self.pc.createOffer()
+            await self.pc.setLocalDescription(offer)
+            await self._send({
+                "type": "offer",
+                "sdp": self.pc.localDescription.sdp,
+            })
+            log.info("Sent WebRTC offer to gateway")
+        except Exception as exc:
+            log.exception("Error making WebRTC offer: %s", exc)
 
     async def _send(self, message):
         await self.ws.send(json.dumps(message))
@@ -106,8 +142,12 @@ class VoiceEdgeClient:
     async def stop(self):
         self._stop.set()
         if self.ws:
-            await self._send({"type": "bye"})
-            await self.ws.close()
+            try:
+                await self._send({"type": "bye"})
+                await self.ws.close()
+            except Exception:
+                pass
+        await self._close_pc()
 
     def set_muted(self, muted):
         self.muted = muted
@@ -125,18 +165,30 @@ def cli_main(args):
     if args.list_devices:
         list_devices()
         return
-    client = VoiceEdgeClient(args.server, args.name, args.room, args.mic, args.speaker)
+    client = VoiceEdgeClient(args.server, args.name, args.room, args.mic, args.speaker, status=print)
     try:
         asyncio.run(client.run())
     except KeyboardInterrupt:
         pass
 
 
+class TkLogHandler(logging.Handler):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def emit(self, record):
+        try:
+            self.callback(self.format(record))
+        except Exception:
+            pass
+
+
 def gui_main():
     root = tk.Tk()
     root.title("VoiceEdge Client")
     frame = ttk.Frame(root, padding=12)
-    frame.grid()
+    frame.grid(sticky="nsew")
     fields = {}
     saved = {}
     if SETTINGS_PATH.exists():
@@ -153,23 +205,36 @@ def gui_main():
         fields[label] = value
     status = tk.StringVar(value="Disconnected")
     ttk.Label(frame, textvariable=status).grid(row=4, column=0, columnspan=2)
-    devices = ["Default"]
+    input_devices = ["Default"]
+    output_devices = ["Default"]
     try:
         import sounddevice as sd
-        devices = ["Default"] + [d["name"] for d in sd.query_devices()]
-    except (OSError, ImportError):
+        for d in sd.query_devices():
+            name = d.get("name", "")
+            if d.get("max_input_channels", 0) > 0 and name not in input_devices:
+                input_devices.append(name)
+            if d.get("max_output_channels", 0) > 0 and name not in output_devices:
+                output_devices.append(name)
+    except Exception:
         pass
     ttk.Label(frame, text="Mic").grid(row=6, column=0, sticky="w")
     mic = tk.StringVar(value=saved.get("mic", "Default"))
-    ttk.Combobox(frame, textvariable=mic, values=devices, width=28).grid(row=6, column=1)
+    ttk.Combobox(frame, textvariable=mic, values=input_devices, width=28).grid(row=6, column=1)
     ttk.Label(frame, text="Speaker").grid(row=7, column=0, sticky="w")
     speaker = tk.StringVar(value=saved.get("speaker", "Default"))
-    ttk.Combobox(frame, textvariable=speaker, values=devices, width=28).grid(row=7, column=1)
-    loop = asyncio.new_event_loop()
+    ttk.Combobox(frame, textvariable=speaker, values=output_devices, width=28).grid(row=7, column=1)
     client = None
+    client_loop = None
+
+    def disconnect():
+        nonlocal client, client_loop
+        if client and client_loop and client_loop.is_running():
+            asyncio.run_coroutine_threadsafe(client.stop(), client_loop)
+        status.set("Disconnected")
 
     def connect():
-        nonlocal client
+        nonlocal client, client_loop
+        disconnect()
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_PATH.write_text(json.dumps({
             "server": fields["Gateway"].get(), "name": fields["Your name"].get(),
@@ -178,11 +243,16 @@ def gui_main():
         client = VoiceEdgeClient(fields["Gateway"].get(), fields["Your name"].get(),
                                  fields["Room"].get(), None if mic.get() == "Default" else mic.get(),
                                  None if speaker.get() == "Default" else speaker.get(), status=status.set)
-        threading.Thread(target=lambda: loop.run_until_complete(client.run()), daemon=True).start()
+        def run_thread():
+            nonlocal client_loop
+            client_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(client_loop)
+            try:
+                client_loop.run_until_complete(client.run())
+            finally:
+                client_loop.close()
 
-    def disconnect():
-        if client:
-            asyncio.run_coroutine_threadsafe(client.stop(), loop)
+        threading.Thread(target=run_thread, daemon=True).start()
     ttk.Button(frame, text="Connect", command=connect).grid(row=3, column=0)
     ttk.Button(frame, text="Disconnect", command=disconnect).grid(row=3, column=1)
     muted = tk.BooleanVar()
@@ -202,7 +272,49 @@ def gui_main():
             finally:
                 sock.close()
         threading.Thread(target=listen, daemon=True).start()
-    ttk.Button(frame, text="Find gateway", command=find_gateway).grid(row=8, column=1)
+
+    log_frame = ttk.Frame(frame)
+    log_text = tk.Text(log_frame, height=8, width=42, wrap="word", bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 8))
+    log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=log_text.yview)
+    log_text.configure(yscrollcommand=log_scroll.set)
+    log_text.pack(side="left", fill="both", expand=True)
+    log_scroll.pack(side="right", fill="y")
+    log_visible = False
+
+    def append_log(msg):
+        def _insert():
+            log_text.insert("end", msg + "\n")
+            log_text.see("end")
+        root.after(0, _insert)
+
+    ui_handler = TkLogHandler(append_log)
+    ui_handler.setFormatter(logging.Formatter("%(asctime)s: %(message)s", datefmt="%H:%M:%S"))
+    logging.getLogger().addHandler(ui_handler)
+
+    if CLIENT_LOG_PATH.exists():
+        try:
+            lines = CLIENT_LOG_PATH.read_text(encoding="utf-8").splitlines()[-25:]
+            for line in lines:
+                log_text.insert("end", line + "\n")
+            log_text.see("end")
+        except Exception:
+            pass
+
+    def toggle_logs():
+        nonlocal log_visible
+        log_visible = not log_visible
+        if log_visible:
+            log_frame.grid(row=10, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+            log_btn.configure(text="Logs ▲")
+        else:
+            log_frame.grid_remove()
+            log_btn.configure(text="Logs ▼")
+
+    btn_row = ttk.Frame(frame)
+    btn_row.grid(row=8, column=1, sticky="w")
+    ttk.Button(btn_row, text="Find gateway", command=find_gateway).pack(side="left", padx=2)
+    log_btn = ttk.Button(btn_row, text="Logs ▼", command=toggle_logs)
+    log_btn.pack(side="left", padx=2)
     ttk.Label(frame, text="Headphones recommended").grid(row=5, column=0, columnspan=2)
     root.mainloop()
 

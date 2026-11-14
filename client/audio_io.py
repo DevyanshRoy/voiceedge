@@ -2,6 +2,7 @@
 """Sounddevice-backed audio tracks for VoiceEdge."""
 
 import asyncio
+from fractions import Fraction
 import queue
 import threading
 
@@ -23,14 +24,24 @@ class MicrophoneAudioTrack(AudioStreamTrack):
         self.muted = False
         self._queue = queue.Queue(maxsize=20)
         self._pts = 0
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=FRAME_SAMPLES,
-            device=device,
-            callback=self._callback,
-        )
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=FRAME_SAMPLES,
+                device=device,
+                callback=self._callback,
+            )
+        except Exception:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=FRAME_SAMPLES,
+                device=None,
+                callback=self._callback,
+            )
         self._stream.start()
 
     def _callback(self, data, _frames, _time, _status):
@@ -51,7 +62,7 @@ class MicrophoneAudioTrack(AudioStreamTrack):
         frame = av.AudioFrame.from_ndarray(data.T, format="s16", layout="mono")
         frame.sample_rate = SAMPLE_RATE
         frame.pts = self._pts
-        frame.time_base = av.Rational(1, SAMPLE_RATE)
+        frame.time_base = Fraction(1, SAMPLE_RATE)
         self._pts += samples
         return frame
 
@@ -65,9 +76,22 @@ class MicrophoneAudioTrack(AudioStreamTrack):
 class SpeakerOutput:
     def __init__(self, device=None):
         self._queue = asyncio.Queue(maxsize=30)
-        self._stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16", device=device
-        )
+        self.channels = 2
+        try:
+            self._stream = sd.OutputStream(
+                samplerate=SAMPLE_RATE, channels=self.channels, dtype="int16", device=device
+            )
+        except Exception:
+            try:
+                self.channels = 1
+                self._stream = sd.OutputStream(
+                    samplerate=SAMPLE_RATE, channels=self.channels, dtype="int16", device=device
+                )
+            except Exception:
+                self.channels = 2
+                self._stream = sd.OutputStream(
+                    samplerate=SAMPLE_RATE, channels=self.channels, dtype="int16", device=None
+                )
         self._stream.start()
         self._task = None
 
@@ -78,14 +102,17 @@ class SpeakerOutput:
         try:
             while True:
                 frame = await track.recv()
-                samples = frame.to_ndarray().astype(np.int16).reshape(-1, CHANNELS)
-                try:
-                    self._queue.put_nowait(samples)
-                except asyncio.QueueFull:
-                    await self._queue.get()
-                    await self._queue.put(samples)
-                await asyncio.sleep(0)
-                self._stream.write(samples)
+                data = frame.to_ndarray().astype(np.int16)
+                if data.ndim == 2:
+                    if self.channels == 2:
+                        samples = data.T.copy() if data.shape[0] == 2 else np.repeat(data.T, 2, axis=1)
+                    else:
+                        samples = data.mean(axis=0, dtype=np.int16).reshape(-1, 1)
+                else:
+                    samples = data.reshape(-1, self.channels)
+
+                if self._stream and not self._stream.closed:
+                    await asyncio.to_thread(self._stream.write, samples)
         except asyncio.CancelledError:
             raise
         except (MediaStreamError, OSError, RuntimeError):
@@ -94,5 +121,6 @@ class SpeakerOutput:
     def stop(self):
         if self._task:
             self._task.cancel()
-        self._stream.stop()
-        self._stream.close()
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()

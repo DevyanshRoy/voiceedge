@@ -26,9 +26,10 @@ def run_monitor(controller):
 
     from rich.live import Live
     with Live(render(), refresh_per_second=1) as live:
-        while controller.running:
+        while True:
             live.update(render())
-            _handle_key(controller)
+            if not _handle_key(controller):
+                break
             time.sleep(1)
 
 
@@ -36,7 +37,7 @@ def _handle_key(controller):
     try:
         import msvcrt
         if not msvcrt.kbhit():
-            return
+            return True
         key = msvcrt.getwch().lower()
         if key == "s":
             controller.start()
@@ -46,5 +47,8 @@ def _handle_key(controller):
             controller.restart()
         elif key == "m":
             controller.toggle_maintenance()
+        elif key == "q":
+            return False
     except (ImportError, OSError):
-        return
+        return True
+    return True
