@@ -11,7 +11,12 @@ log = logging.getLogger("voiceedge.audio")
 
 import av
 import numpy as np
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except Exception as exc:
+    sd = None
+    log.warning("Could not initialize sounddevice at import: %s", exc)
+
 from aiortc.mediastreams import AudioStreamTrack, MediaStreamError
 
 SAMPLE_RATE = 48000
@@ -27,6 +32,9 @@ class MicrophoneAudioTrack(AudioStreamTrack):
         self.muted = False
         self._queue = queue.Queue(maxsize=20)
         self._pts = 0
+        self._stream = None
+        if sd is None:
+            return
         try:
             self._stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
@@ -109,6 +117,8 @@ class SpeakerOutput:
         self.channels = 2
         self._task = None
         self._stream = None
+        if sd is None:
+            return
 
         for ch in (2, 1):
             try:
@@ -126,16 +136,20 @@ class SpeakerOutput:
                 continue
 
         if not self._stream:
-            self.channels = 2
-            self._stream = sd.OutputStream(
-                samplerate=SAMPLE_RATE,
-                channels=self.channels,
-                dtype="int16",
-                blocksize=FRAME_SAMPLES,
-                device=None,
-                callback=self._callback,
-            )
-        self._stream.start()
+            try:
+                self.channels = 2
+                self._stream = sd.OutputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=self.channels,
+                    dtype="int16",
+                    blocksize=FRAME_SAMPLES,
+                    device=None,
+                    callback=self._callback,
+                )
+            except Exception:
+                self._stream = None
+        if self._stream:
+            self._stream.start()
 
     def _callback(self, outdata, frames, time_info, status):
         try:
